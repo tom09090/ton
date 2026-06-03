@@ -1,11 +1,20 @@
+# GitHub Actions: МОЩНЫЙ фаззинг TON с ASan/UBSan.
+# Рычаги глубины: сид-корпус из реальных .boc, словарь, -fork по всем ядрам,
+# value-profile, параллельный matrix (каждая цель на своей машине), накопительный
+# корпус между прогонами (cache) и длинный прогон.
+#
+# Установка (как раньше): папка ton-fuzz/ в корне репо + строка add_subdirectory(ton-fuzz)
+# в конце CMakeLists.txt + этот файл в .github/workflows/ci-fuzz.yml.
+# Запуск: Actions -> ton-fuzz -> Run workflow (можно задать seconds, по умолчанию 3 часа).
+
 name: ton-fuzz
 
 on:
   workflow_dispatch:
     inputs:
       fuzz_seconds:
-        description: "Seconds per fuzz target"
-        default: "300"
+        description: "Seconds per fuzz target (e.g. 10800 = 3h, max ~20000 под лимит 6h)"
+        default: "10800"
 
 permissions:
   contents: read
@@ -13,7 +22,11 @@ permissions:
 jobs:
   fuzz:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 350           # близко к лимиту GitHub 6 часов
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_boc_deserialize, fuzz_boc_decompress, fuzz_tvm_run, fuzz_adnl_packet]
     env:
       FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds }}
     steps:
@@ -27,49 +40,72 @@ jobs:
           sudo apt-get install -y build-essential cmake ninja-build \
             libssl-dev zlib1g-dev liblz4-dev libsodium-dev libmicrohttpd-dev \
             libsecp256k1-dev pkg-config
-          wget -q https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 18 || true
+          wget -q https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 18 || true
 
       - name: Configure (ASan + UBSan + Fuzz)
-        env:
-          CC: clang-18
-          CXX: clang++-18
+        env: { CC: clang-18, CXX: clang++-18 }
         run: |
           cmake -B build-fuzz -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DTON_USE_ASAN=ON \
-            -DTON_USE_UBSAN=ON \
-            -DTON_FUZZ=ON \
-            .
+            -DTON_USE_ASAN=ON -DTON_USE_UBSAN=ON -DTON_FUZZ=ON .
 
-      - name: Build fuzz targets
+      - name: Build ${{ matrix.target }}
+        run: cmake --build build-fuzz --target ${{ matrix.target }} -j"$(nproc)"
+
+      # Накопительный корпус: восстанавливаем прошлый, после прогона сохраняем обогащённый.
+      - name: Restore corpus cache
+        uses: actions/cache@v4
+        with:
+          path: corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Seed corpus from real .boc files
         run: |
-          cmake --build build-fuzz --target \
-            fuzz_boc_deserialize fuzz_boc_decompress fuzz_tvm_run fuzz_adnl_packet \
-            -j"$(nproc)"
+          mkdir -p corpus/${{ matrix.target }} findings
+          # Для BoC/TVM целей кладём настоящие ячейки из репозитория как сиды.
+          case "${{ matrix.target }}" in
+            fuzz_boc_deserialize|fuzz_boc_decompress|fuzz_tvm_run)
+              find . -path ./build-fuzz -prune -o -name '*.boc' -print 2>/dev/null \
+                | while read -r f; do cp "$f" "corpus/${{ matrix.target }}/seed_$(sha1sum "$f" | cut -c1-12).boc" 2>/dev/null || true; done
+              ;;
+          esac
+          echo "seeds in corpus: $(ls corpus/${{ matrix.target }} | wc -l)"
 
-      - name: Run fuzzers
+      - name: Run ${{ matrix.target }} (deep)
         run: |
           set +e
-          mkdir -p findings
-          for t in fuzz_boc_deserialize fuzz_boc_decompress fuzz_tvm_run fuzz_adnl_packet; do
-            bin=$(find build-fuzz -type f -name "$t" | head -1)
-            echo "=== running $t ($bin) for ${FUZZ_SECONDS}s ==="
-            mkdir -p "corpus/$t"
-            "$bin" -max_total_time="${FUZZ_SECONDS}" -timeout=15 -rss_limit_mb=2048 \
-                   -artifact_prefix="findings/${t}-" "corpus/$t" 2>&1 | tail -40
-          done
-          echo "=== crashes / sanitizer findings ==="
-          ls -la findings/ || echo "no findings dir"
-          if [ -n "$(ls -A findings 2>/dev/null)" ]; then
-            echo "FINDINGS PRESENT"; exit 1
-          fi
+          bin=$(find build-fuzz -type f -name "${{ matrix.target }}" | head -1)
+          echo "=== $bin for ${FUZZ_SECONDS}s, fork=$(nproc), value-profile on ==="
+          DICT=""
+          [ -f ton-fuzz/boc.dict ] && DICT="-dict=ton-fuzz/boc.dict"
+          "$bin" \
+            -fork="$(nproc)" \
+            -ignore_crashes=1 \
+            -use_value_profile=1 \
+            -reduce_inputs=1 \
+            -max_len=262144 \
+            -rss_limit_mb=4096 \
+            -timeout=25 \
+            -max_total_time="${FUZZ_SECONDS}" \
+            $DICT \
+            -artifact_prefix="findings/${{ matrix.target }}-" \
+            corpus/${{ matrix.target }} 2>&1 | tail -60
+          echo "=== crash artifacts ==="
+          ls -la findings/ 2>/dev/null
 
-      - name: Upload findings
+      - name: Upload crashes
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-findings
+          name: fuzz-findings-${{ matrix.target }}
           path: findings/
           if-no-files-found: ignore
+
+      - name: Fail if crashes found
+        run: |
+          if [ -n "$(ls -A findings 2>/dev/null)" ]; then
+            echo "::error::FUZZ FINDINGS for ${{ matrix.target }} — see artifact fuzz-findings-${{ matrix.target }}"
+            exit 1
+          fi
+          echo "No crashes for ${{ matrix.target }} this run."
