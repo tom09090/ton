@@ -27,7 +27,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     return 0;
   }
   try {
-    vm::CellSlice cs(vm::NoVm(), code_cell);
     auto stack = td::make_ref<vm::Stack>();
     long long gas_limit = 100000;       // жёсткий лимит газа
     int global_version = 9;             // актуальная версия глобальных правил TVM

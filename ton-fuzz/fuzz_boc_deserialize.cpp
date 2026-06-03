@@ -13,11 +13,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   if (res.is_ok()) {
     auto cell = res.move_as_ok();
     if (cell.not_null()) {
-      // Принудительно материализуем хэш/обход, чтобы зацепить пост-парсинговые пути.
+      // get_hash() форсирует обход дерева ячеек и финализацию — этого достаточно,
+      // чтобы зацепить пост-парсинговые пути.
       cell->get_hash();
-      vm::CellSlice cs(vm::NoVm(), cell);
-      (void)cs.size();
-      (void)cs.size_refs();
     }
   }
   return 0;
