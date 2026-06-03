@@ -1,0 +1,88 @@
+# GitHub Actions workflow: собрать TON с ASan/UBSan и прогнать фаззеры из ton-fuzz/.
+# "Машина" — это раннер GitHub, своя не нужна.
+#
+# Установка:
+#   1. Форкни ton-blockchain/ton.
+#   2. Скопируй папку ton-fuzz/ в корень репозитория.
+#   3. В конец корневого CMakeLists.txt добавь строку:  add_subdirectory(ton-fuzz)
+#   4. Положи этот файл в .github/workflows/ci-fuzz.yml
+#   5. Запусти вручную: вкладка Actions → "ton-fuzz" → Run workflow.
+#
+# Каждый фаззер крутится FUZZ_SECONDS секунд. Креши/находки санитайзеров сохраняются как артефакты.
+
+name: ton-fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: "Seconds per fuzz target"
+        default: "300"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build \
+            libssl-dev zlib1g-dev liblz4-dev libsodium-dev libmicrohttpd-dev \
+            libsecp256k1-dev pkg-config
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18 || true
+
+      - name: Configure (ASan + UBSan + Fuzz)
+        env:
+          CC: clang-18
+          CXX: clang++-18
+        run: |
+          cmake -B build-fuzz -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DTON_USE_ASAN=ON \
+            -DTON_USE_UBSAN=ON \
+            -DTON_FUZZ=ON \
+            .
+
+      - name: Build fuzz targets
+        run: |
+          cmake --build build-fuzz --target \
+            fuzz_boc_deserialize fuzz_boc_decompress fuzz_tvm_run fuzz_adnl_packet \
+            -j"$(nproc)"
+
+      - name: Run fuzzers
+        run: |
+          set +e
+          mkdir -p findings
+          for t in fuzz_boc_deserialize fuzz_boc_decompress fuzz_tvm_run fuzz_adnl_packet; do
+            bin=$(find build-fuzz -type f -name "$t" | head -1)
+            echo "=== running $t ($bin) for ${FUZZ_SECONDS}s ==="
+            mkdir -p "corpus/$t"
+            "$bin" -max_total_time="${FUZZ_SECONDS}" -timeout=15 -rss_limit_mb=2048 \
+                   -artifact_prefix="findings/${t}-" "corpus/$t" 2>&1 | tail -40
+          done
+          echo "=== crashes / sanitizer findings ==="
+          ls -la findings/ || echo "no findings dir"
+          # Падение фаззера = найден баг; помечаем job как failed, чтобы было видно.
+          if [ -n "$(ls -A findings 2>/dev/null)" ]; then
+            echo "FINDINGS PRESENT"; exit 1
+          fi
+
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: findings/
+          if-no-files-found: ignore
