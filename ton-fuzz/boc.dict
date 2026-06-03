@@ -1,0 +1,31 @@
+# libFuzzer dictionary for TON BoC / cell parsing.
+# Помогает фаззеру строить валидные заголовки вместо случайного мусора.
+
+# BoC magic bytes (vm/boc.cpp)
+boc_generic="\xb5\xee\x9c\x72"
+boc_idx="\x68\xff\x65\xf3"
+boc_idx_crc32c="\xac\xc3\xa7\x28"
+
+# Compression algorithm prefixes (boc-compression.cpp: 0=BaselineLZ4, 1=Improved, 2=ImprovedWithState)
+algo_baseline="\x00"
+algo_improved="\x01"
+algo_improved_state="\x02"
+
+# ref/offset byte-size flag bytes (low 3 bits = ref_byte_size)
+flag_b1="\x01"
+flag_b2="\x02"
+flag_b3="\x03"
+flag_b4="\x04"
+has_index_crc="\xc1"
+
+# small cell descriptors (d1: refs+special; d2: data length)
+d1_zero="\x00"
+d1_special="\x05"
+d2_small="\x02"
+
+# common zero/full bytes
+zeros="\x00\x00\x00\x00"
+ffff="\xff\xff\xff\xff"
+
+# LZ4 frame magic (for compressed-boc payloads)
+lz4_magic="\x04\x22\x4d\x18"
